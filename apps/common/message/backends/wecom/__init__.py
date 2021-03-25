@@ -28,6 +28,11 @@ class URL:
     SEND_MESSAGE = 'https://qyapi.weixin.qq.com/cgi-bin/message/send'
 
 
+class ErrorCode:
+    # https://open.work.weixin.qq.com/api/doc/90000/90139/90313#%E9%94%99%E8%AF%AF%E7%A0%81%EF%BC%9A81013
+    RECIPIENTS_INVALID = 81013  # UserID、部门ID、标签ID全部非法或无权限。
+
+
 def update_values(default: dict, others: dict):
     for key in default.keys():
         if key in others:
@@ -46,6 +51,22 @@ def digest(corpid, corpsecret):
     md5.update(corpsecret.encode())
     digest = md5.hexdigest()
     return digest
+
+
+class DictWrapper:
+    def __init__(self, data:dict):
+        self._dict = data
+
+    def __getitem__(self, item):
+        # 企业微信返回的数据，不能完全信任，所以字典操作包在异常里
+        try:
+            self._dict[item]
+        except KeyError as e:
+            logger.error(f'WeCom response 200 but get field from json error: error={e}')
+            raise WeComError
+
+    def __getattr__(self, item):
+        return getattr(self._dict, item)
 
 
 class Requests:
@@ -88,6 +109,24 @@ class WeCom:
         self._requests = Requests(timeout=timeout)
         self._init_access_token()
 
+    def _check_http_is_200(self, response):
+        if response.status_code != 200:
+            # 正常情况下不会返回非 200 响应码
+            logger.error(f'Request WeCom error: '
+                         f'status_code={response.status_code} '
+                         f'\ncontent={response.content}')
+            raise WeComError
+
+    def _check_errcode_is_0(self, data: DictWrapper):
+        errcode = data['errcode']
+        if errcode != 0:
+            # 如果代码写的对，配置没问题，这里不该出错，系统性错误，直接抛异常
+            errmsg = data['errmsg']
+            logger.error(f'WeCom response 200 but errcode wrong: '
+                         f'errcode={errcode} '
+                         f'errmsg={errmsg} ')
+            raise WeComError
+
     def _init_access_token(self):
         self._access_token_cache_key = digest(self._corpid, self._corpsecret)
 
@@ -99,41 +138,23 @@ class WeCom:
         # 缓存中没有 access_token ，去企业微信请求
         params = {'corpid': self._corpid, 'corpsecret': self._corpsecret}
         response = self._requests.get(url=URL.GET_TOKEN, params=params)
+        self._check_http_is_200(response)
 
-        if response.status_code != 200:
-            # 正常情况下不会返回非 200 响应码
-            logger.error(f'Request WeCom error: '
-                         f'status_code={response.status_code} '
-                         f'\ncontent={response.content}')
-            raise WeComError
+        data = DictWrapper(response.json())
+        self._check_errcode_is_0(data)
 
-        data = response.json()
-        try:
-            # 企业微信返回的数据，不能完全信任，所以字典操作包在异常里
-            errcode = data['errcode']
+        # 请求成功了
+        access_token = data['access_token']
+        expires_in = data['expires_in']
 
-            if errcode != 0:
-                # 如果代码写的对，配置没问题，这里不该出错，系统性错误，直接抛异常
-                errmsg = data['errmsg']
-                logger.error(f'WeCom response 200 but errcode wrong: '
-                             f'errcode={errcode} '
-                             f'errmsg={errmsg} ')
-                raise WeComError
-
-            # 请求成功了
-            access_token = data['access_token']
-            expires_in = data['expires_in']
-
-            cache.set(self._access_token_cache_key, access_token, expires_in)
-            self._access_token = access_token
-        except KeyError as e:
-            logger.error(f'WeCom response 200 but get field from json error: error={e}')
-            raise WeComError
+        cache.set(self._access_token_cache_key, access_token, expires_in)
+        self._access_token = access_token
 
     def send_text(self, users: Iterable, msg: AnyStr, **kwargs):
         """
         https://open.work.weixin.qq.com/api/doc/90000/90135/90236
         """
+        users = tuple(users)
 
         extra_params = {
             "safe": 0,
@@ -154,4 +175,22 @@ class WeCom:
         }
         params = {'access_token': self._access_token}
         response = self._requests.post(URL.SEND_MESSAGE, params=params, json=body)
-        return response
+        self._check_http_is_200(response)
+
+        data = DictWrapper(response.json())
+        errcode = data['errcode']
+        if errcode == ErrorCode.RECIPIENTS_INVALID:
+            # 全部接收人无权限或不存在
+            return users
+        self._check_errcode_is_0(data)
+
+        invaliduser = data['invaliduser']
+        if not invaliduser:
+            return ()
+
+        if isinstance(invaliduser, str):
+            logger.error(f'WeCom send text 200, but invaliduser is not str: invaliduser={invaliduser}')
+            raise WeComError
+
+        invalid_users = invaliduser.split('|')
+        return invalid_users
