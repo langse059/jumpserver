@@ -76,34 +76,59 @@ class Requests:
 
 
 class WeCom:
+    """
+    非业务数据导致的错误直接抛异常，说明是系统配置错误，业务代码不用理会
+    """
+
     def __init__(self, corpid, corpsecret, agentid, timeout=None):
         self._corpid = corpid
         self._corpsecret = corpsecret
         self._agentid = agentid
-        self._init_access_token()
-        self._timeout = timeout
+
         self._requests = Requests(timeout=timeout)
+        self._init_access_token()
 
     def _init_access_token(self):
         self._access_token_cache_key = digest(self._corpid, self._corpsecret)
 
         access_token = cache.get(self._access_token_cache_key)
-        if not access_token:
-            params = {'corpid': self._corpid, 'corpsecret': self._corpsecret}
-            response = self._request.get(url=URL.GET_TOKEN, params=params)
-            if response.status_code == 200:
-                data = response.json()
-                access_token = data.get('access_token')
-                expires_in = data.get('expires_in')
-                # TODO 错误处理
-                cache.set(self._access_token_cache_key, access_token, expires_in)
-            else:
-                logger.error(f'Request WeCom error: '
-                             f'status_code={response.status_code} '
-                             f'\ncontent={response.content}')
+        if access_token:
+            self._access_token = access_token
+            return
+
+        # 缓存中没有 access_token ，去企业微信请求
+        params = {'corpid': self._corpid, 'corpsecret': self._corpsecret}
+        response = self._requests.get(url=URL.GET_TOKEN, params=params)
+
+        if response.status_code != 200:
+            # 正常情况下不会返回非 200 响应码
+            logger.error(f'Request WeCom error: '
+                         f'status_code={response.status_code} '
+                         f'\ncontent={response.content}')
+            raise WeComError
+
+        data = response.json()
+        try:
+            # 企业微信返回的数据，不能完全信任，所以字典操作包在异常里
+            errcode = data['errcode']
+
+            if errcode != 0:
+                # 如果代码写的对，配置没问题，这里不该出错，系统性错误，直接抛异常
+                errmsg = data['errmsg']
+                logger.error(f'WeCom response 200 but errcode wrong: '
+                             f'errcode={errcode} '
+                             f'errmsg={errmsg} ')
                 raise WeComError
 
-        self._access_token = access_token
+            # 请求成功了
+            access_token = data['access_token']
+            expires_in = data['expires_in']
+
+            cache.set(self._access_token_cache_key, access_token, expires_in)
+            self._access_token = access_token
+        except KeyError as e:
+            logger.error(f'WeCom response 200 but get field from json error: error={e}')
+            raise WeComError
 
     def send_text(self, users: Iterable, msg: AnyStr, **kwargs):
         """
